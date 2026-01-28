@@ -228,22 +228,26 @@ class HLSProxy:
         self.proxy_sessions = {}
 
     @staticmethod
-    def _compute_key_headers(key_url: str, secret_key: str) -> tuple[int, int] | None:
+    def _compute_key_headers(key_url: str, secret_key: str,
+                             user_agent: str = None) -> tuple[int, int, str, str] | None:
         """
-        Compute X-Key-Timestamp and X-Key-Nonce for a /key/ URL.
+        Compute X-Key-Timestamp, X-Key-Nonce, X-Fingerprint, and X-Key-Path for a /key/ URL.
 
         Algorithm:
         1. Extract resource and number from URL pattern /key/{resource}/{number}
         2. ts = Unix timestamp in seconds
         3. hmac_hash = HMAC-SHA256(resource, secret_key).hex()
         4. nonce = proof-of-work: find i where MD5(hmac+resource+number+ts+i)[:4] < 0x1000
+        5. fingerprint = SHA256(useragent + screen_resolution + timezone + language).hex()[:16]
+        6. key_path = HMAC-SHA256("resource|number|ts|fingerprint", secret_key).hex()[:16]
 
         Args:
             key_url: The key URL containing /key/{resource}/{number}
             secret_key: The HMAC secret key
+            user_agent: The user agent string for fingerprint calculation
 
         Returns:
-            Tuple of (timestamp, nonce) or None if URL doesn't match pattern
+            Tuple of (timestamp, nonce, fingerprint, key_path) or None if URL doesn't match pattern
         """
         # Extract resource and number from URL
         pattern = r"/key/([^/]+)/(\d+)"
@@ -273,7 +277,23 @@ class HLSProxy:
                 nonce = i
                 break
 
-        return ts, nonce
+        # Compute fingerprint
+        fp_user_agent = user_agent if user_agent else "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+        fp_screen_res = "1920x1080"
+        fp_timezone = "UTC"
+        fp_language = "en"
+
+        fp_string = f"{fp_user_agent}{fp_screen_res}{fp_timezone}{fp_language}"
+
+        fingerprint = hashlib.sha256(fp_string.encode("utf-8")).hexdigest()[:16]
+
+        # Compute key-path
+        key_path_string = f"{resource}|{number}|{ts}|{fingerprint}"
+        key_path = hmac.new(
+            secret_key.encode("utf-8"), key_path_string.encode("utf-8"), hashlib.sha256
+        ).hexdigest()[:16]
+
+        return ts, nonce, fingerprint, key_path
 
     async def _get_session(self):
         if self.session is None or self.session.closed:
@@ -1223,16 +1243,20 @@ class HLSProxy:
             async with ClientSession(timeout=timeout) as session:
                 secret_key = headers.pop('X-Secret-Key', None)
 
-                # Calcola X-Key-Timestamp e X-Key-Nonce se abbiamo la secret_key
+                # Calcola X-Key-Timestamp, X-Key-Nonce, X-Fingerprint, e X-Key-Path se abbiamo la secret_key
                 if secret_key and '/key/' in key_url:
-                    nonce_result = self._compute_key_headers(key_url, secret_key)
+                    # Get user agent from X-User-Agent header or fall back to User-Agent
+                    user_agent = headers.get('X-User-Agent') or headers.get('User-Agent') or headers.get('user-agent')
+                    nonce_result = self._compute_key_headers(key_url, secret_key, user_agent)
                     if nonce_result:
-                        ts, nonce = nonce_result
+                        ts, nonce, fingerprint, key_path = nonce_result
                         headers['X-Key-Timestamp'] = str(ts)
                         headers['X-Key-Nonce'] = str(nonce)
-                        logger.info(f"🔐 Computed nonce headers: ts={ts}, nonce={nonce}")
+                        headers['X-Fingerprint'] = fingerprint
+                        headers['X-Key-Path'] = key_path
+                        logger.info(f"🔐 Computed key headers: ts={ts}, nonce={nonce}, fingerprint={fingerprint}, key_path={key_path}")
                     else:
-                        logger.warning(f"⚠️ Could not compute nonce headers for {key_url}")
+                        logger.warning(f"⚠️ Could not compute key headers for {key_url}")
 
                 # Caso 'auth' - URL che contengono 'auth' richiedono headers speciali
                 if 'auth' in key_url.lower():
