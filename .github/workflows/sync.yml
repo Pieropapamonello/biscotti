@@ -1,0 +1,48 @@
+name: Autoaggiornamento
+
+on:
+  schedule:
+    - cron: '0 19 * * *'  # ogni giorno alle 20:00 CET (19:00 UTC)
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/nzo66/EasyProxy.git
+
+      - name: Fetch upstream changes
+        run: git fetch upstream
+
+      - name: Force sync fork from upstream, preserve workflow
+        id: sync
+        run: |
+          # Controlla se ci sono differenze PRIMA del reset
+          if git diff --quiet HEAD upstream/main; then
+            echo "Repository already up to date"
+            echo "no_change=true" >> $GITHUB_OUTPUT
+          else
+            echo "Changes detected, proceeding with sync"
+            cp .github/workflows/sync.yml /tmp/sync.yml
+            git reset --hard upstream/main
+            mkdir -p .github/workflows
+            mv /tmp/sync.yml .github/workflows/sync.yml
+            git add .
+            git commit -m "Restore workflow after forced sync" || echo "No changes needed"
+            git push origin main --force
+            echo "no_change=false" >> $GITHUB_OUTPUT
+          fi
