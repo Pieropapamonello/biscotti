@@ -44,8 +44,12 @@ if [ "$ENABLE_WARP" = "true" ]; then
         echo "🔗 Connecting to WARP..."
         
         # Add exclusions for domains that block WARP (Cinemacity)
-        warp-cli --accept-tos add-excluded-domain cinemacity.cc
-        warp-cli --accept-tos add-excluded-domain cccdn.net
+        # We try both new (v2024+) and old warp-cli commands for compatibility
+        (warp-cli --accept-tos tunnel host add cinemacity.cc > /dev/null 2>&1 || \
+         warp-cli --accept-tos add-excluded-domain cinemacity.cc > /dev/null 2>&1) || true
+         
+        (warp-cli --accept-tos tunnel host add cccdn.net > /dev/null 2>&1 || \
+         warp-cli --accept-tos add-excluded-domain cccdn.net > /dev/null 2>&1) || true
         
         warp-cli --accept-tos connect
         

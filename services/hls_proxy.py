@@ -1557,6 +1557,7 @@ class HLSProxy:
                 "expired vixsrc embed url" in error_msg
                 or ("vixsrc" in error_msg and "expired" in error_msg and "embed" in error_msg)
             )
+            is_not_found = "404" in error_msg or "not found" in error_msg
             is_temporary_error = any(
                 x in error_msg
                 for x in [
@@ -1580,11 +1581,17 @@ class HLSProxy:
                 logger.info("Expired VixSrc embed URL rejected: %s", str(e))
                 return web.Response(text=str(e), status=410)
 
-            # Se è un errore temporaneo (sito offline), logga solo un WARNING senza traceback
+            if is_not_found:
+                logger.warning(f"🔍 {extractor_name}: Content not found (404). File missing or possible IP block. (Try opening the link in a browser to verify) - {str(e)}")
+                return web.Response(text=f"Content not found: {str(e)}", status=404)
+
+            # Gestione errori di connessione o blocchi
             if is_temporary_error:
-                logger.warning(
-                    f"⚠️ {extractor_name}: Service temporarily unavailable - {str(e)}"
-                )
+                if "403" in error_msg or "forbidden" in error_msg:
+                    logger.error(f"🚫 {extractor_name}: Access denied (403 Forbidden). Possible IP block or WAF protection. - {str(e)}")
+                else:
+                    logger.warning(f"📡 {extractor_name}: Connection failed (Timeout/Connection Error). Site might be down or IP is blocked. - {str(e)}")
+                
                 return web.Response(
                     text=f"Service temporarily unavailable: {str(e)}", status=503
                 )

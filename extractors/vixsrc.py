@@ -169,6 +169,14 @@ class VixSrcExtractor:
                 else:
                     raise ExtractorError(f"All {retries} attempts failed for {url}: {str(e)}")
 
+            except aiohttp.ClientResponseError as e:
+                if e.status == 404:
+                    raise ExtractorError(f"VixSrc content not found (404): {url}")
+                
+                if attempt == retries - 1:
+                    raise ExtractorError(f"Final HTTP error {e.status} for {url}: {str(e)}")
+                await asyncio.sleep(initial_delay)
+
             except Exception as e:
                 logger.error("Non-network error attempt %s for %s: %s", attempt + 1, url, str(e))
                 if attempt == retries - 1:
