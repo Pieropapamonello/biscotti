@@ -67,14 +67,8 @@ RUN git init . \
     && git fetch \
     && git checkout -f main
 
-# Installiamo le dipendenze (usiamo la lista diretta per sicurezza)
-RUN pip install --no-cache-dir \
-    aiohttp aiohttp-socks gunicorn python-dotenv zstandard \
-    beautifulsoup4 lxml python-socks pycryptodome pydash2hls \
-    playwright ddddocr Pillow curl_cffi
-
-# Fix Python package structure
-RUN touch __init__.py services/__init__.py extractors/__init__.py utils/__init__.py routes/__init__.py
+# Installiamo le dipendenze dal file requirements del progetto
+RUN pip install --no-cache-dir -r requirements.txt
 
 RUN python -m playwright install chromium
 RUN chmod +x entrypoint.sh

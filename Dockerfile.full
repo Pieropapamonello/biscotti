@@ -68,16 +68,11 @@ RUN git clone https://github.com/ThePhaseless/Byparr.git /app/byparr_src \
 
 # 5. EasyProxy Dependencies
 WORKDIR /app
-RUN pip install --no-cache-dir \
-    aiohttp aiohttp-socks gunicorn python-dotenv zstandard \
-    beautifulsoup4 lxml python-socks pycryptodome pydash2hls \
-    playwright ddddocr Pillow curl_cffi
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia esplicita
 COPY . .
-
-# Fix Python package structure
-RUN touch __init__.py services/__init__.py extractors/__init__.py utils/__init__.py routes/__init__.py
 
 RUN python -m playwright install chromium
 RUN chmod +x entrypoint.sh
