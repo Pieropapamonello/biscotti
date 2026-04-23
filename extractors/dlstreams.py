@@ -99,7 +99,7 @@ class DLStreamsExtractor:
             chrome_path = os.getenv("CHROME_BIN") or os.getenv("CHROME_EXE_PATH")
             logger.debug(f"DLStreams initialization - CHROME_BIN: {os.getenv('CHROME_BIN')}, CHROME_EXE_PATH: {os.getenv('CHROME_EXE_PATH')}")
             
-            # Use headless on Linux/Termux/Docker, headful on Windows for testing
+            # Use headless on Linux/Termux/Docker, headful on Windows for stability
             is_linux = sys.platform.startswith("linux")
             is_headless = is_linux
             

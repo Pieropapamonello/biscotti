@@ -11,7 +11,6 @@ ENV FLARESOLVERR_URL=http://localhost:8191
 ENV BYPARR_URL=http://localhost:8192
 ENV BYPARR_PORT=8192
 
-# 2. System Dependencies (FFmpeg, Chromium, Xvfb, Cloudflare WARP)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
@@ -23,8 +22,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cloudflare-warp \
     netcat-openbsd \
     ffmpeg \
-    xvfb \
-    xauth \
     chromium \
     libnss3 \
     libatk1.0-0 \

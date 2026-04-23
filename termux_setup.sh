@@ -85,7 +85,7 @@ proot-distro login $DISTRO_NAME -- bash -c '
     
     echo "[ℹ️] Inside Ubuntu: Installing bare minimum Python & stable Browser..."
     apt-get install -y --fix-missing \
-        python3 python3-venv python3.13-venv python-is-python3 git curl wget ffmpeg xvfb xauth \
+        python3 python3-venv python3.13-venv python-is-python3 git curl wget ffmpeg \
         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
         libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 libcairo2 \
         libatspi2.0-0 fonts-liberation ca-certificates chromium chromium-driver \
@@ -129,7 +129,7 @@ proot-distro login $DISTRO_NAME -- bash -c '
         git clone https://github.com/FlareSolverr/FlareSolverr.git "$EP_DIR/flaresolverr"
     fi
     cd "$EP_DIR/flaresolverr"
-    sed -i "s|options.add_argument('--no-sandbox')|options.add_argument('--no-sandbox'); options.add_argument('--disable-dev-shm-usage'); options.add_argument('--disable-gpu')|" src/utils.py 2>/dev/null || true
+    sed -i "s|options.add_argument('--no-sandbox')|options.add_argument('--no-sandbox'); options.add_argument('--disable-dev-shm-usage'); options.add_argument('--disable-gpu'); options.add_argument('--headless=new')|" src/utils.py 2>/dev/null || true
     sed -i "s|driver_executable_path=driver_exe_path|driver_executable_path=\"/usr/bin/chromedriver\"|" src/utils.py 2>/dev/null || true
     pip install --no-cache-dir --ignore-installed -r requirements.txt --break-system-packages || true
 
@@ -164,7 +164,6 @@ cat > "$PROOT_ROOTFS/easyproxy_start.sh" << 'LAUNCHER_EOF'
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export PIP_BREAK_SYSTEM_PACKAGES=1
 export PORT=7860
-export DISPLAY=:99
 export ENABLE_WARP=false
 
 # Auto-detect Chromium path
@@ -189,24 +188,17 @@ fi
 PORT=${PORT:-7860}
 
 # Kill any existing processes
-pkill -9 Xvfb python3 node 2>/dev/null || true
-rm -f /tmp/.X99-lock 2>/dev/null || true
+pkill -9 python3 node 2>/dev/null || true
 
 echo ""
 echo "╔══════════════════════════════════════════╗"
 echo "║     EasyProxy Full - Termux Edition      ║"
-echo "║     Port: $PORT | WARP: Disabled          ║"
+echo "║     Port: $PORT | Mode: Headless          ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# Start Xvfb
-echo "🖥️  Starting virtual display..."
-/usr/bin/Xvfb :99 -screen 0 1366x768x24 -nolisten tcp &
-XVFB_PID=$!
-sleep 1
-
 # Start FlareSolverr
-echo "🚀 Starting FlareSolverr..."
+echo "🚀 Starting FlareSolverr (Headless)..."
 cd /root/EasyProxy/flaresolverr && PORT=8191 python3 src/flaresolverr.py &
 FLARE_PID=$!
 
@@ -225,7 +217,7 @@ cd /root/EasyProxy
 python3 -c "from app import app; from aiohttp import web; web.run_app(app, host='0.0.0.0', port=$PORT)"
 
 # Cleanup on exit
-kill $XVFB_PID $FLARE_PID $BYPARR_PID 2>/dev/null || true
+kill $FLARE_PID $BYPARR_PID 2>/dev/null || true
 LAUNCHER_EOF
 chmod +x "$PROOT_ROOTFS/easyproxy_start.sh"
 
