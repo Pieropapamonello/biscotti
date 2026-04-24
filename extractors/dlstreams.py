@@ -21,7 +21,7 @@ class ExtractorError(Exception):
 class DLStreamsExtractor:
     """Extractor for dlhd.dad / dlstreams streams."""
 
-    def __init__(self, request_headers: dict = None, proxies: list = None):
+    def __init__(self, request_headers: dict = None, proxies: list = None, bypass_warp: bool = False):
         self.request_headers = request_headers or {}
         self.entry_origin = DLSTREAMS_ENTRY_ORIGIN
         # Runtime-discovered stream origin (learned from browser network responses).
@@ -33,6 +33,7 @@ class DLStreamsExtractor:
         self.session = None
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self.proxies = proxies or []
+        self.bypass_warp_active = bypass_warp
         self._browser_key_cache: dict[str, bytes] = {}
         # We no longer cache the manifest text to ensure live streams are fresh.
         # self._browser_manifest_cache: dict[str, str] = {}

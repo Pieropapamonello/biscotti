@@ -1135,7 +1135,7 @@ class HLSProxy:
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = DLStreamsExtractor(
-                        request_headers, proxies=proxy_list
+                        request_headers, proxies=proxy_list, bypass_warp=bypass_warp
                     )
                 return self.extractors[key]
             elif "lulustream" in url:
