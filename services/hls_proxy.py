@@ -1769,8 +1769,8 @@ class HLSProxy:
                         },
                     )
 
-            # Procedi con il proxy dello stream (passando l'eventuale bypass_warp attivato dall'estrattore)
-            return await self._proxy_stream(request, stream_url, stream_headers, bypass_warp=bypass_warp)
+            # Procedi con il proxy dello stream (passando l'eventuale bypass_warp attivato dall'estrattore e il proxy selezionato)
+            return await self._proxy_stream(request, stream_url, stream_headers, bypass_warp=bypass_warp, forced_proxy=selected_proxy)
 
         except Exception as e:
             # ✅ MIGLIORATO: Distingui tra errori temporanei (sito offline) ed errori critici
@@ -2454,8 +2454,10 @@ class HLSProxy:
 
             # ✅ Use pooled session for better performance
             bypass_warp = request.query.get("warp", "").lower() == "off"
+            forced_proxy = request.query.get("proxy") or None
+            
             session, _ = await self._get_proxy_session(
-                segment_url, bypass_warp=bypass_warp
+                segment_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
             )
             disable_ssl = get_ssl_setting_for_url(segment_url, TRANSPORT_ROUTES)
             # ✅ Use yarl.URL with encoded=True to prevent double-encoding of commas
@@ -2523,11 +2525,13 @@ class HLSProxy:
             logger.error(f"Error in segment proxy: {str(e)}")
             return web.Response(text=f"Segment error: {str(e)}", status=500)
 
-    async def _proxy_stream(self, request, stream_url, stream_headers, bypass_warp=None):
+    async def _proxy_stream(self, request, stream_url, stream_headers, bypass_warp=None, forced_proxy=None):
         """Effettua il proxy dello stream con gestione manifest e AES-128"""
         if bypass_warp is None:
             bypass_warp = request.query.get("warp", "").lower() == "off"
-        forced_proxy = request.query.get("proxy") or None
+        
+        # Priorità: proxy passato esplicitamente -> proxy in query string
+        forced_proxy = forced_proxy or request.query.get("proxy") or None
         try:
             # Ping DLStreams extractor to keep browser alive during playback
             # Use robust markers: Daddy's domains, 'premium' pattern, 'mono.css', or Referer/Origin headers
