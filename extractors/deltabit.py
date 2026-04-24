@@ -134,7 +134,8 @@ class DeltabitExtractor:
                     url = url.replace("deltabit.co/", "deltabit.co/e/")
         
         logger.debug(f"Deltabit: Starting unified FlareSolverr bypass for {url}")
-             url = url.replace("deltabit.bz/", "deltabit.bz/e/")
+        url = url.replace("deltabit.bz/", "deltabit.bz/e/")
+        url = url.replace("deltabit.sx/", "deltabit.sx/e/")
         
         parsed_url = urlparse(url)
         domain = parsed_url.netloc
