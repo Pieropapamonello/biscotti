@@ -117,14 +117,92 @@ class MaxstreamExtractor:
             logger.debug(f"DoH resolution failed for {domain}: {e}")
         return []
 
+    async def _curl_cffi_request(self, url: str, proxy, method: str, is_binary: bool, **kwargs):
+        """
+        Single-shot request via curl_cffi with Chrome TLS impersonation.
+
+        uprot.net inspects the TLS handshake and serves a captcha page to any
+        client whose fingerprint isn't a real browser (aiohttp / httpx / python
+        requests all trigger it, even from residential IPs). curl_cffi makes
+        the connection indistinguishable from real Chrome, so uprot serves
+        the maxstream / stayonline redirect link directly on the first GET —
+        no captcha solver needed for `/msf/`, `/msfi/`, `/msfld/`.
+
+        Returns the response body (str or bytes) on success, None on failure
+        / non-success / Cloudflare challenge — the caller falls through to
+        the regular aiohttp path.
+        """
+        try:
+            from curl_cffi import requests as cffi_requests
+        except ImportError:
+            logger.debug("curl_cffi not installed, skipping browser-impersonation path")
+            return None
+
+        proxies_arg = {"http": proxy, "https": proxy} if proxy else None
+        headers = kwargs.get("headers") or self.base_headers
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+
+        def _do_request():
+            try:
+                r = cffi_requests.request(
+                    method,
+                    url,
+                    headers=headers,
+                    data=kwargs.get("data"),
+                    proxies=proxies_arg,
+                    impersonate="chrome131",
+                    timeout=30,
+                    allow_redirects=True,
+                )
+                if r.status_code >= 400:
+                    return ("status_fail", r.status_code, None)
+                if is_binary:
+                    return ("ok_binary", r.status_code, r.content)
+                return ("ok_text", r.status_code, r.text)
+            except Exception as inner:
+                return ("error", 0, str(inner))
+
+        kind, status, payload = await loop.run_in_executor(None, _do_request)
+
+        if kind == "ok_text":
+            if any(marker in payload.lower() for marker in ["cf-challenge", "ray id", "checking your browser"]):
+                logger.debug(f"curl_cffi got CF challenge on {url}, falling back to aiohttp")
+                return None
+            logger.debug(f"curl_cffi {method} {url} → {status} text len={len(payload)}")
+            return payload
+        if kind == "ok_binary":
+            logger.debug(f"curl_cffi {method} {url} → {status} binary len={len(payload)}")
+            return payload
+        if kind == "status_fail":
+            logger.debug(f"curl_cffi {method} {url} → status {status}, falling back")
+            return None
+        logger.debug(f"curl_cffi {method} {url} → exception: {payload}, falling back")
+        return None
+
     async def _smart_request(self, url: str, method="GET", is_binary=False, **kwargs):
         """Request with automatic retry using different proxies and resolver fallback on connection failure."""
         last_error = None
         parsed_url = urlparse(url)
         domain = parsed_url.netloc
-        
+
         # Clear previous mapping for this domain to start fresh
         self.resolver.mapping.pop(domain, None)
+
+        # Path 0: For uprot.net, try curl_cffi with Chrome TLS impersonation FIRST.
+        # This eliminates the captcha-solver path for /msf/, /msfi/, /msfld/
+        # because uprot serves the redirect link directly when it sees a real
+        # browser fingerprint. Falls through to the aiohttp paths on failure.
+        if "uprot.net" in domain:
+            cffi_result = await self._curl_cffi_request(url, None, method, is_binary, **kwargs)
+            if cffi_result is not None:
+                return cffi_result
+            for p in self._get_proxies_for_url(url):
+                cffi_result = await self._curl_cffi_request(url, p, method, is_binary, **kwargs)
+                if cffi_result is not None:
+                    return cffi_result
+            logger.debug(f"curl_cffi paths exhausted for {url}, falling back to aiohttp")
 
         # Determine paths to try: Direct, Proxies, and then resolver override
         paths = []
