@@ -280,39 +280,74 @@ class MaxstreamExtractor:
         raise ExtractorError(f"Connection failed for {url} after trying all paths. Last error: {last_error}")
 
     async def _solve_uprot_captcha(self, text: str, original_url: str) -> str:
-        """Find, download and solve captcha on uprot page."""
+        """
+        Find, download/decode and solve captcha on uprot page.
+
+        Modern uprot.net embeds the captcha image inline as
+        `<img src="data:image/png;base64,XXXX">`. The legacy logic of looking
+        for `src="/captcha/..."` (an external image URL) misses this entirely
+        and always returns None. We now handle both cases:
+          1) inline `data:image/...;base64,...` → decode the base64 directly
+          2) external `/captcha/...` URL → fetch via _smart_request
+        Then run ddddocr OCR and POST the answer.
+        """
         try:
             import ddddocr
         except ImportError:
             logger.error("ddddocr not installed. Cannot solve captcha.")
             return None
-            
+
         soup = BeautifulSoup(text, "lxml")
-        img_tag = soup.find("img", src=re.compile(r'/captcha|/image/'))
+
+        # Look for either an inline data-URL captcha (modern uprot) OR an
+        # external captcha URL (legacy uprot / other forks).
+        img_tag = soup.find(
+            "img",
+            src=re.compile(r"^data:image/[a-z]+;base64,|/captcha|/image/", re.I),
+        )
         form = soup.find("form")
-        
+
         if not img_tag or not form:
+            logger.debug("Captcha solve: no img/form found in page")
             return None
-            
-        captcha_url = img_tag["src"]
-        if captcha_url.startswith("/"):
-            parsed = urlparse(original_url)
-            captcha_url = f"{parsed.scheme}://{parsed.netloc}{captcha_url}"
-            
-        logger.debug(f"Downloading captcha from: {captcha_url}")
-        img_data = await self._smart_request(captcha_url, is_binary=True)
-        
+
+        captcha_src = img_tag["src"]
+
+        # Get the raw bytes of the captcha image
+        if captcha_src.startswith("data:"):
+            # Inline base64 — decode directly, no network call
+            try:
+                import base64
+                b64_payload = captcha_src.split(",", 1)[1]
+                img_data = base64.b64decode(b64_payload)
+                logger.debug(f"Captcha solve: decoded inline base64 ({len(img_data)} bytes)")
+            except Exception as e:
+                logger.debug(f"Captcha solve: failed to decode inline base64: {e}")
+                return None
+        else:
+            # External URL — fetch
+            captcha_url = captcha_src
+            if captcha_url.startswith("/"):
+                parsed = urlparse(original_url)
+                captcha_url = f"{parsed.scheme}://{parsed.netloc}{captcha_url}"
+            logger.debug(f"Captcha solve: fetching external image from {captcha_url}")
+            img_data = await self._smart_request(captcha_url, is_binary=True)
+
         if not img_data:
             return None
-            
+
         # Initialize ddddocr (lazy init for performance)
-        if not hasattr(self, '_ocr_engine'):
+        if not hasattr(self, "_ocr_engine"):
             self._ocr_engine = ddddocr.DdddOcr(show_ad=False)
-            
+
         # Solve
         res = self._ocr_engine.classification(img_data)
-        logger.debug(f"Captcha solved: {res}")
-        
+        # Captcha is always digits; keep only those to avoid OCR junk chars
+        res_digits = "".join(c for c in str(res) if c.isdigit())
+        logger.debug(f"Captcha solved: raw={res!r} digits={res_digits!r}")
+        if not res_digits:
+            return None
+
         # Submit form
         form_action = form.get("action", "")
         if not form_action or form_action == "#":
@@ -320,29 +355,29 @@ class MaxstreamExtractor:
         elif form_action.startswith("/"):
             parsed = urlparse(original_url)
             form_action = f"{parsed.scheme}://{parsed.netloc}{form_action}"
-            
-        # Prepare data (find the captcha input name)
-        captcha_input = soup.find("input", {"name": re.compile(r'captcha|code|val', re.I)})
-        if not captcha_input:
-            # Fallback to common names
-            field_name = "captcha"
-        else:
-            field_name = captcha_input["name"]
-            
-        post_data = {field_name: res}
-        # Add other hidden fields
+
+        # Find the captcha input field name
+        captcha_input = soup.find("input", {"name": re.compile(r"captcha|code|val", re.I)})
+        field_name = captcha_input["name"] if captcha_input else "captcha"
+
+        post_data = {field_name: res_digits}
         for hidden in form.find_all("input", type="hidden"):
             if hidden.get("name"):
                 post_data[hidden["name"]] = hidden.get("value", "")
-        
-        logger.debug(f"Submitting captcha to: {form_action}")
+
+        logger.debug(f"Submitting captcha to: {form_action} field={field_name}")
         headers = {**self.base_headers, "referer": original_url}
-        solved_text = await self._smart_request(form_action, method="POST", data=post_data, headers=headers)
-        
-        # Try to parse the new page
+        solved_text = await self._smart_request(
+            form_action, method="POST", data=post_data, headers=headers
+        )
+
+        if not solved_text:
+            return None
+
         try:
             return self._parse_uprot_html(solved_text)
-        except:
+        except Exception as e:
+            logger.debug(f"Captcha solve: parse_uprot_html failed: {e}")
             return None
 
     def _parse_uprot_html(self, text: str) -> str:
