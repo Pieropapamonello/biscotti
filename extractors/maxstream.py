@@ -156,15 +156,28 @@ class MaxstreamExtractor:
                     timeout=30,
                     allow_redirects=True,
                 )
+                # Snapshot cookies + status BEFORE checking status, so the
+                # caller can reuse them for the captcha POST without re-fetching
+                # (uprot 503s on a second GET in quick succession).
+                try:
+                    cookies = {c.name: c.value for c in r.cookies.jar}
+                except Exception:
+                    cookies = dict(r.cookies) if r.cookies else {}
                 if r.status_code >= 400:
-                    return ("status_fail", r.status_code, None)
+                    return ("status_fail", r.status_code, None, cookies)
                 if is_binary:
-                    return ("ok_binary", r.status_code, r.content)
-                return ("ok_text", r.status_code, r.text)
+                    return ("ok_binary", r.status_code, r.content, cookies)
+                return ("ok_text", r.status_code, r.text, cookies)
             except Exception as inner:
-                return ("error", 0, str(inner))
+                return ("error", 0, str(inner), {})
 
-        kind, status, payload = await loop.run_in_executor(None, _do_request)
+        kind, status, payload, cookies = await loop.run_in_executor(None, _do_request)
+        # Stash uprot cookies so _solve_uprot_captcha_once can reuse them for
+        # the POST without re-fetching (which uprot rate-limits with 503).
+        if "uprot.net" in url and cookies:
+            self._last_uprot_cookies = cookies
+            self._last_uprot_url = url
+            self._last_uprot_proxy = proxy
 
         if kind == "ok_text":
             if any(marker in payload.lower() for marker in ["cf-challenge", "ray id", "checking your browser"]):
@@ -319,55 +332,30 @@ class MaxstreamExtractor:
             logger.error("ddddocr not installed. Cannot solve captcha.")
             return None
 
-        # Re-fetch the captcha page with curl_cffi and capture its cookies.
-        # We then pass the cookies dict explicitly to the POST so PHPSESSID +
-        # the captcha hash flow through. Earlier attempts with
-        # cffi_requests.Session() failed with 503 over an HTTP proxy
-        # (proxy seemingly drops the persistent connection).
         try:
             from curl_cffi import requests as cffi_requests
         except ImportError:
             logger.debug("Captcha solve: curl_cffi not available")
             return None
 
-        proxy = None
-        proxies_for_url = self._get_proxies_for_url(original_url)
-        if proxies_for_url:
-            proxy = proxies_for_url[0]
+        # Reuse cookies + proxy from the original GET (stashed by
+        # _curl_cffi_request) instead of re-fetching. uprot.net 503s a
+        # second GET in quick succession, so this is the only reliable path.
+        captcha_cookies = getattr(self, "_last_uprot_cookies", None)
+        proxy = getattr(self, "_last_uprot_proxy", None)
         proxies_arg = {"http": proxy, "https": proxy} if proxy else None
-        captcha_cookies = None
+
+        if not captcha_cookies:
+            logger.debug("Captcha solve: no cached uprot cookies, cannot solve")
+            return None
+
+        # Note: `text` is the body the caller already has — we trust it was
+        # captured in the same GET as the cookies, so the captcha image
+        # embedded in it is the one bound to those cookies.
 
         import asyncio
         loop = asyncio.get_running_loop()
-
-        def _do_get():
-            try:
-                return cffi_requests.get(
-                    original_url,
-                    headers=self.base_headers,
-                    proxies=proxies_arg,
-                    impersonate="chrome131",
-                    timeout=20,
-                    allow_redirects=True,
-                )
-            except Exception as inner:
-                return inner
-
-        resp = await loop.run_in_executor(None, _do_get)
-        if isinstance(resp, Exception):
-            logger.debug(f"Captcha solve: GET failed: {resp}")
-            return None
-        if resp.status_code >= 400:
-            logger.debug(f"Captcha solve: GET status {resp.status_code}")
-            return None
-
-        text = resp.text  # fresh HTML for parsing img + form
-        # Snapshot cookies that the captcha image is bound to.
-        try:
-            captcha_cookies = {c.name: c.value for c in resp.cookies.jar}
-        except Exception:
-            captcha_cookies = dict(resp.cookies) if resp.cookies else {}
-        logger.debug(f"Captcha solve: GET ok, cookies={list(captcha_cookies.keys())}")
+        logger.debug(f"Captcha solve: reusing cookies={list(captcha_cookies.keys())} proxy={'yes' if proxy else 'no'}")
 
         soup = BeautifulSoup(text, "lxml")
 
