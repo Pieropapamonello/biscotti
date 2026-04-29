@@ -279,21 +279,36 @@ class MaxstreamExtractor:
         
         raise ExtractorError(f"Connection failed for {url} after trying all paths. Last error: {last_error}")
 
-    async def _solve_uprot_captcha(self, text: str, original_url: str) -> str:
+    async def _solve_uprot_captcha(self, text: str, original_url: str, max_attempts: int = 4) -> str:
         """
-        Find, decode and solve captcha on uprot page.
+        Find, decode and solve captcha on uprot page — with retry loop.
+
+        ddddocr OCR has roughly 70-80% accuracy on uprot's 3-digit captcha;
+        a single attempt is too unreliable. Each attempt opens a fresh
+        curl_cffi.Session (so PHPSESSID + captcha cookie pair are consistent
+        between the GET that returns the captcha and the POST that submits
+        the answer — uprot binds them) and tries OCR + submit. We give up
+        after `max_attempts` failures.
+        """
+        for attempt in range(1, max_attempts + 1):
+            result = await self._solve_uprot_captcha_once(text, original_url)
+            if result:
+                if attempt > 1:
+                    logger.debug(f"Captcha solve: succeeded on attempt {attempt}")
+                return result
+            logger.debug(f"Captcha solve: attempt {attempt}/{max_attempts} failed, retrying" if attempt < max_attempts else f"Captcha solve: all {max_attempts} attempts exhausted")
+        return None
+
+    async def _solve_uprot_captcha_once(self, text: str, original_url: str) -> str:
+        """
+        Single captcha-solve attempt. Returns the parsed redirect link on
+        success, None on any failure (caller may retry).
 
         Modern uprot.net embeds the captcha image inline as
         `<img src="data:image/png;base64,XXXX">` and binds the answer to the
         PHPSESSID cookie set by the GET that returned the captcha page —
         the POST has to be made with that same cookie or uprot just shows a
-        new captcha page (looks like an OCR failure but is actually a session
-        mismatch).
-
-        Solution: re-issue the GET inside a shared curl_cffi.Session so the
-        Set-Cookie from GET flows automatically into the POST. This requires
-        the input `text` to be re-fetched within the same session, but it's
-        the only way to keep the session intact for the form submit.
+        new captcha page.
         """
         try:
             import ddddocr
