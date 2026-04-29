@@ -190,18 +190,21 @@ class MaxstreamExtractor:
         # Clear previous mapping for this domain to start fresh
         self.resolver.mapping.pop(domain, None)
 
-        # Path 0: For uprot.net, try curl_cffi with Chrome TLS impersonation FIRST.
-        # This eliminates the captcha-solver path for /msf/, /msfi/, /msfld/
-        # because uprot serves the redirect link directly when it sees a real
-        # browser fingerprint. Falls through to the aiohttp paths on failure.
+        # Path 0: For uprot.net, try curl_cffi with Chrome TLS impersonation.
+        # uprot serves the redirect link / folder content / captcha page when
+        # it sees a real browser fingerprint. Always go via the configured
+        # proxy first (uprot bans datacenter IPs aggressively); only try
+        # naked as a last resort. Each call to a proxied request can use
+        # 1 concurrent slot, so do not stack a redundant naked attempt
+        # before the proxy one.
         if "uprot.net" in domain:
-            cffi_result = await self._curl_cffi_request(url, None, method, is_binary, **kwargs)
-            if cffi_result is not None:
-                return cffi_result
             for p in self._get_proxies_for_url(url):
                 cffi_result = await self._curl_cffi_request(url, p, method, is_binary, **kwargs)
                 if cffi_result is not None:
                     return cffi_result
+            cffi_result = await self._curl_cffi_request(url, None, method, is_binary, **kwargs)
+            if cffi_result is not None:
+                return cffi_result
             logger.debug(f"curl_cffi paths exhausted for {url}, falling back to aiohttp")
 
         # Determine paths to try: Direct, Proxies, and then resolver override
