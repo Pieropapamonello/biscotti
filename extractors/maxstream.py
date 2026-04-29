@@ -316,54 +316,55 @@ class MaxstreamExtractor:
             logger.error("ddddocr not installed. Cannot solve captcha.")
             return None
 
-        # Re-fetch the captcha page inside a curl_cffi session so cookies set
-        # by the GET (PHPSESSID, captcha hash) are carried into the POST.
+        # Re-fetch the captcha page with curl_cffi and capture its cookies.
+        # We then pass the cookies dict explicitly to the POST so PHPSESSID +
+        # the captcha hash flow through. Earlier attempts with
+        # cffi_requests.Session() failed with 503 over an HTTP proxy
+        # (proxy seemingly drops the persistent connection).
         try:
             from curl_cffi import requests as cffi_requests
         except ImportError:
-            logger.debug("Captcha solve: curl_cffi not available, falling back to legacy session-less flow")
-            cffi_requests = None
+            logger.debug("Captcha solve: curl_cffi not available")
+            return None
 
-        if cffi_requests is not None:
-            session = cffi_requests.Session()
+        proxy = None
+        proxies_for_url = self._get_proxies_for_url(original_url)
+        if proxies_for_url:
+            proxy = proxies_for_url[0]
+        proxies_arg = {"http": proxy, "https": proxy} if proxy else None
+        captcha_cookies = None
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+
+        def _do_get():
             try:
-                proxy = None
-                proxies_for_url = self._get_proxies_for_url(original_url)
-                if proxies_for_url:
-                    proxy = proxies_for_url[0]
-                proxies_arg = {"http": proxy, "https": proxy} if proxy else None
+                return cffi_requests.get(
+                    original_url,
+                    headers=self.base_headers,
+                    proxies=proxies_arg,
+                    impersonate="chrome131",
+                    timeout=20,
+                    allow_redirects=True,
+                )
+            except Exception as inner:
+                return inner
 
-                import asyncio
-                loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(None, _do_get)
+        if isinstance(resp, Exception):
+            logger.debug(f"Captcha solve: GET failed: {resp}")
+            return None
+        if resp.status_code >= 400:
+            logger.debug(f"Captcha solve: GET status {resp.status_code}")
+            return None
 
-                def _do_get():
-                    try:
-                        return session.get(
-                            original_url,
-                            headers=self.base_headers,
-                            proxies=proxies_arg,
-                            impersonate="chrome131",
-                            timeout=20,
-                            allow_redirects=True,
-                        )
-                    except Exception as inner:
-                        return inner
-
-                resp = await loop.run_in_executor(None, _do_get)
-                if isinstance(resp, Exception):
-                    logger.debug(f"Captcha solve: session GET failed: {resp}")
-                    session.close()
-                    return None
-                if resp.status_code >= 400:
-                    logger.debug(f"Captcha solve: session GET status {resp.status_code}")
-                    session.close()
-                    return None
-                text = resp.text  # use the freshly-fetched text
-            except Exception as e:
-                logger.debug(f"Captcha solve: session setup failed: {e}")
-                session = None
-        else:
-            session = None
+        text = resp.text  # fresh HTML for parsing img + form
+        # Snapshot cookies that the captcha image is bound to.
+        try:
+            captcha_cookies = {c.name: c.value for c in resp.cookies.jar}
+        except Exception:
+            captcha_cookies = dict(resp.cookies) if resp.cookies else {}
+        logger.debug(f"Captcha solve: GET ok, cookies={list(captcha_cookies.keys())}")
 
         soup = BeautifulSoup(text, "lxml")
 
@@ -433,39 +434,35 @@ class MaxstreamExtractor:
             if hidden.get("name"):
                 post_data[hidden["name"]] = hidden.get("value", "")
 
-        logger.debug(f"Submitting captcha to: {form_action} field={field_name}")
+        logger.debug(f"Submitting captcha to: {form_action} field={field_name} cookies={list((captcha_cookies or {}).keys())}")
         headers = {**self.base_headers, "referer": original_url}
 
-        # POST through the SAME session as the GET so PHPSESSID + captcha cookies
-        # are sent — uprot binds the captcha answer to the cookie that issued it.
-        if session is not None:
-            import asyncio
-            loop = asyncio.get_running_loop()
+        # POST with the cookies captured from the GET — uprot binds the captcha
+        # answer to PHPSESSID + captcha hash. Without these cookies the POST
+        # gets a fresh captcha page back.
+        def _do_post():
+            try:
+                return cffi_requests.post(
+                    form_action,
+                    data=post_data,
+                    headers=headers,
+                    cookies=captcha_cookies or {},
+                    proxies=proxies_arg,
+                    impersonate="chrome131",
+                    timeout=20,
+                    allow_redirects=True,
+                )
+            except Exception as inner:
+                return inner
 
-            def _do_post():
-                try:
-                    return session.post(
-                        form_action,
-                        data=post_data,
-                        headers=headers,
-                        proxies=proxies_arg,
-                        impersonate="chrome131",
-                        timeout=20,
-                        allow_redirects=True,
-                    )
-                except Exception as inner:
-                    return inner
-
-            resp = await loop.run_in_executor(None, _do_post)
-            session.close()
-            if isinstance(resp, Exception) or resp.status_code >= 400:
-                logger.debug(f"Captcha solve: session POST failed: {resp}")
-                return None
-            solved_text = resp.text
-        else:
-            solved_text = await self._smart_request(
-                form_action, method="POST", data=post_data, headers=headers
-            )
+        post_resp = await loop.run_in_executor(None, _do_post)
+        if isinstance(post_resp, Exception):
+            logger.debug(f"Captcha solve: POST failed: {post_resp}")
+            return None
+        if post_resp.status_code >= 400:
+            logger.debug(f"Captcha solve: POST status {post_resp.status_code}")
+            return None
+        solved_text = post_resp.text
 
         if not solved_text:
             return None
