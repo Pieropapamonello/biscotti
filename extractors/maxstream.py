@@ -117,6 +117,51 @@ class MaxstreamExtractor:
             logger.debug(f"DoH resolution failed for {domain}: {e}")
         return []
 
+
+    async def _fetch_folder_direct(self, url: str):
+        """Fetch /msfld/ folder HTML directly via residential proxy (no captcha needed).
+        
+        uprot.net serves folder listings without captcha to Italian residential IPs.
+        This is much faster and more reliable than the curl_cffi + captcha path.
+        """
+        proxies = self._get_proxies_for_url(url)
+        if not proxies:
+            proxies = self.proxies
+
+        # Try aiohttp with each proxy
+        for proxy in proxies:
+            if not proxy:
+                continue
+            session = await self._get_session(proxy=proxy)
+            try:
+                headers = {
+                    **self.base_headers,
+                    "accept-language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+                }
+                async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                    if resp.status < 300:
+                        text = await resp.text()
+                        if text and len(text) > 500 and "/msfi/" in text:
+                            logger.info(f"Folder direct fetch via proxy OK, len={len(text)}")
+                            return text
+                        logger.debug(f"Folder direct fetch: no /msfi/ links (len={len(text) if text else 0})")
+                    else:
+                        logger.debug(f"Folder direct fetch: HTTP {resp.status}")
+            except Exception as e:
+                logger.debug(f"Folder direct fetch via proxy error: {e}")
+            finally:
+                if not session.closed:
+                    await session.close()
+
+        # Fallback: try curl_cffi with TLS fingerprinting
+        for proxy in (proxies or [None]):
+            result = await self._curl_cffi_request(url, proxy, "GET", False)
+            if result and len(result) > 500 and "/msfi/" in result:
+                logger.info(f"Folder curl_cffi fetch OK, len={len(result)}")
+                return result
+
+        return None
+
     async def _curl_cffi_request(self, url: str, proxy, method: str, is_binary: bool, **kwargs):
         """
         Single-shot request via curl_cffi with Chrome TLS impersonation.
@@ -554,23 +599,40 @@ class MaxstreamExtractor:
         # and /msfi/ into /msei/ (a deprecated path that returns 500 for new IDs).
         link = re.sub(r"/msf/", "/mse/", link)
 
-        # Direct request (user should provide non-datacenter proxy in GLOBAL_PROXY)
-        text = await self._smart_request(link)
-
-        # If this is a folder URL, resolve the requested episode first, then
-        # continue the normal flow on the picked /msfi/ link.
+        # /msfld/ folder handling: fetch folder listing directly via residential
+        # proxy (no captcha needed for IT IPs), find the episode's /msfi/ link,
+        # then resolve it through the normal captcha flow.
         if "/msfld/" in link:
             if season is None or episode is None:
                 raise ExtractorError(
                     "msfld folder URL requires 'season' and 'episode' parameters"
                 )
-            episode_link = self._parse_uprot_folder(text, season, episode)
+
+            # Step 1: Fetch folder HTML via residential proxy (no captcha)
+            folder_html = await self._fetch_folder_direct(link)
+
+            if not folder_html:
+                # Fallback: try _smart_request (may trigger captcha on some IPs)
+                logger.debug("Folder direct fetch failed, trying _smart_request fallback")
+                folder_html = await self._smart_request(link)
+
+            if not folder_html:
+                raise ExtractorError("Failed to fetch msfld folder page")
+
+            # Step 2: Find the /msfi/ link for the requested episode
+            episode_link = self._parse_uprot_folder(folder_html, season, episode)
             if not episode_link:
                 raise ExtractorError(
                     f"Episode S{season}E{episode} not found in msfld folder"
                 )
-            link = episode_link
-            text = await self._smart_request(link)
+
+            logger.info(f"Folder resolved S{season}E{episode} -> {episode_link}")
+
+            # Step 3: Resolve the single episode URL (normal captcha flow)
+            return await self.get_uprot(episode_link)
+
+        # Direct request (user should provide non-datacenter proxy in GLOBAL_PROXY)
+        text = await self._smart_request(link)
 
         # 1. Try normal parse
         res = self._parse_uprot_html(text)
