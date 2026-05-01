@@ -652,6 +652,112 @@ class MaxstreamExtractor:
         logger.error(f"Uprot Parse Failure. Content: {text[:2000]}...")
         raise ExtractorError("Redirect link not found in uprot page")
 
+    async def _follow_maxstream_redirects(self, url: str) -> str:
+        """Follow the uprots -> watchfree -> emvvv redirect chain.
+        
+        maxstream.video/uprots/{id} is NOT the final embed page.
+        It redirects through one or more intermediate pages to
+        maxstream.video/emvvv/{hash} which contains the actual video player.
+        We must follow this chain to get the embed page URL.
+        """
+        if "/emvvv/" in url:
+            return url  # Already at the embed page
+            
+        logger.info(f"Following MaxStream redirect chain from: {url}")
+        
+        # Try following redirects via curl_cffi (best TLS fingerprint)
+        try:
+            from curl_cffi import requests as cffi_requests
+            import asyncio
+            loop = asyncio.get_running_loop()
+            
+            for proxy in (self._get_proxies_for_url(url) or [None]):
+                proxies_arg = {"http": proxy, "https": proxy} if proxy else None
+                
+                def _do_follow():
+                    try:
+                        r = cffi_requests.get(
+                            url,
+                            headers={
+                                **self.base_headers,
+                                "referer": "https://uprot.net/",
+                            },
+                            proxies=proxies_arg,
+                            impersonate="chrome131",
+                            timeout=20,
+                            allow_redirects=True,
+                        )
+                        return r.url, r.status_code, r.text
+                    except Exception as e:
+                        return None, 0, str(e)
+                        
+                final_url, status, body = await loop.run_in_executor(None, _do_follow)
+                
+                if final_url and status < 400:
+                    logger.info(f"Redirect chain resolved: {url} -> {final_url}")
+                    
+                    # If we landed on a watchfree page, construct emvvv URL
+                    if "watchfree" in final_url:
+                        parts = final_url.rstrip("/").split("/")
+                        # watchfree URL format: .../watchfree/{something}/{hash}
+                        wf_idx = None
+                        for i, p in enumerate(parts):
+                            if p == "watchfree":
+                                wf_idx = i
+                                break
+                        if wf_idx is not None and len(parts) > wf_idx + 2:
+                            emvvv_url = f"https://maxstream.video/emvvv/{parts[wf_idx + 2]}"
+                            logger.info(f"watchfree -> emvvv: {emvvv_url}")
+                            return emvvv_url
+                    
+                    # If final URL contains emvvv, use it directly
+                    if "/emvvv/" in final_url:
+                        return final_url
+                    
+                    # If we got redirected to a different maxstream URL, use that
+                    if "maxstream.video" in final_url and final_url != url:
+                        return final_url
+                    
+                    # If the body contains video sources, the page IS the embed
+                    if body and ("sources" in body or "urlset" in body or ".m3u8" in body):
+                        return final_url or url
+                        
+                    logger.debug(f"Redirect landed on unexpected URL: {final_url}")
+        except ImportError:
+            logger.debug("curl_cffi not available for redirect following")
+        
+        # Fallback: try aiohttp with redirect following
+        for proxy in (self._get_proxies_for_url(url) or [None]):
+            session = await self._get_session(proxy=proxy)
+            try:
+                headers = {**self.base_headers, "referer": "https://uprot.net/"}
+                async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                    final_url = str(resp.url)
+                    if final_url != url:
+                        logger.info(f"aiohttp redirect: {url} -> {final_url}")
+                        if "watchfree" in final_url:
+                            parts = final_url.rstrip("/").split("/")
+                            for i, p in enumerate(parts):
+                                if p == "watchfree" and len(parts) > i + 2:
+                                    return f"https://maxstream.video/emvvv/{parts[i + 2]}"
+                        return final_url
+            except Exception as e:
+                logger.debug(f"aiohttp redirect follow error: {e}")
+            finally:
+                if proxy and not session.closed:
+                    await session.close()
+        
+        # If all else fails, try to construct emvvv URL from uprots pattern
+        # uprots URL format: maxstream.video/uprots/{id} or uprots.net/{id}
+        uprots_match = re.search(r"/uprots?/([a-zA-Z0-9]+)", url)
+        if uprots_match:
+            # Try the uprotem path as alternative
+            uprotem_url = f"https://maxstream.video/uprotem/{uprots_match.group(1)}"
+            logger.info(f"Trying uprotem fallback: {uprotem_url}")
+            return uprotem_url
+        
+        return url  # Return original URL as last resort
+
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Maxstream URL.
 
@@ -661,7 +767,11 @@ class MaxstreamExtractor:
         season = kwargs.get("season")
         episode = kwargs.get("episode")
         maxstream_url = await self.get_uprot(url, season=season, episode=episode)
-        logger.debug(f"Target URL: {maxstream_url}")
+        logger.debug(f"Target URL from uprot: {maxstream_url}")
+        
+        # Follow redirect chain: uprots -> watchfree -> emvvv
+        maxstream_url = await self._follow_maxstream_redirects(maxstream_url)
+        logger.info(f"Final MaxStream URL: {maxstream_url}")
         
         # Use strict headers to avoid Error 131
         headers = {
