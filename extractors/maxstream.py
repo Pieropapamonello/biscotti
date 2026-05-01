@@ -119,16 +119,30 @@ class MaxstreamExtractor:
 
 
     async def _fetch_folder_direct(self, url: str):
-        """Fetch /msfld/ folder HTML directly via residential proxy (no captcha needed).
+        """Fetch /msfld/ folder HTML directly via residential proxy.
         
-        uprot.net serves folder listings without captcha to Italian residential IPs.
-        This is much faster and more reliable than the curl_cffi + captcha path.
+        uprot.net serves folder listings without captcha to Italian residential IPs
+        when the TLS fingerprint looks like a real browser. We try curl_cffi first
+        (Chrome TLS impersonation) for best success rate, then aiohttp as fallback.
         """
         proxies = self._get_proxies_for_url(url)
         if not proxies:
             proxies = self.proxies
 
-        # Try aiohttp with each proxy
+        # Strategy 1: curl_cffi with Chrome TLS (best fingerprint, highest success)
+        for proxy in (proxies or [None]):
+            result = await self._curl_cffi_request(url, proxy, "GET", False)
+            if result and len(result) > 500 and "/msfi/" in result:
+                logger.info(f"Folder curl_cffi fetch OK, len={len(result)}")
+                return result
+            if result and len(result) > 500:
+                logger.debug(f"Folder curl_cffi: got content but no /msfi/ links (captcha?)")
+                # If it's a captcha page, try solving it for the folder
+                captcha_result = await self._solve_folder_captcha(result, url)
+                if captcha_result:
+                    return captcha_result
+
+        # Strategy 2: aiohttp with proxy (fallback)
         for proxy in proxies:
             if not proxy:
                 continue
@@ -142,25 +156,134 @@ class MaxstreamExtractor:
                     if resp.status < 300:
                         text = await resp.text()
                         if text and len(text) > 500 and "/msfi/" in text:
-                            logger.info(f"Folder direct fetch via proxy OK, len={len(text)}")
+                            logger.info(f"Folder aiohttp fetch OK, len={len(text)}")
                             return text
-                        logger.debug(f"Folder direct fetch: no /msfi/ links (len={len(text) if text else 0})")
+                        logger.debug(f"Folder aiohttp: no /msfi/ (len={len(text) if text else 0})")
                     else:
-                        logger.debug(f"Folder direct fetch: HTTP {resp.status}")
+                        logger.debug(f"Folder aiohttp: HTTP {resp.status}")
             except Exception as e:
-                logger.debug(f"Folder direct fetch via proxy error: {e}")
+                logger.debug(f"Folder aiohttp error: {e}")
             finally:
                 if not session.closed:
                     await session.close()
 
-        # Fallback: try curl_cffi with TLS fingerprinting
-        for proxy in (proxies or [None]):
-            result = await self._curl_cffi_request(url, proxy, "GET", False)
-            if result and len(result) > 500 and "/msfi/" in result:
-                logger.info(f"Folder curl_cffi fetch OK, len={len(result)}")
-                return result
-
         return None
+
+    async def _solve_folder_captcha(self, captcha_html: str, folder_url: str):
+        """Solve captcha on a folder page and return the folder listing HTML.
+        
+        Unlike single-video pages, folder pages should show a listing of episodes
+        after captcha is solved, not a redirect. We solve the captcha and check
+        if the response contains /msfi/ links.
+        """
+        if "captcha" not in captcha_html.lower() and "data:image" not in captcha_html:
+            return None
+        
+        logger.info(f"Folder page has captcha, attempting to solve...")
+        
+        for attempt in range(6):
+            result_html = await self._solve_uprot_captcha_for_folder(captcha_html, folder_url)
+            if result_html and "/msfi/" in result_html:
+                logger.info(f"Folder captcha solved on attempt {attempt + 1}, found /msfi/ links")
+                return result_html
+            if result_html:
+                logger.debug(f"Folder captcha attempt {attempt + 1}: solved but no /msfi/ links")
+                # The solved page might be new captcha - use it for next attempt
+                captcha_html = result_html
+            else:
+                logger.debug(f"Folder captcha attempt {attempt + 1}: solve failed")
+                # Re-fetch to get fresh captcha
+                for proxy in (self._get_proxies_for_url(folder_url) or [None]):
+                    fresh = await self._curl_cffi_request(folder_url, proxy, "GET", False)
+                    if fresh and len(fresh) > 200:
+                        captcha_html = fresh
+                        break
+        return None
+
+    async def _solve_uprot_captcha_for_folder(self, text: str, original_url: str):
+        """Single captcha solve attempt that returns the FULL response HTML (not parsed).
+        Unlike _solve_uprot_captcha_once which parses for redirect links, this returns
+        the raw HTML so the caller can check for /msfi/ folder listings.
+        """
+        try:
+            import ddddocr
+        except ImportError:
+            return None
+        try:
+            from curl_cffi import requests as cffi_requests
+        except ImportError:
+            return None
+
+        captcha_cookies = getattr(self, "_last_uprot_cookies", None)
+        proxy = getattr(self, "_last_uprot_proxy", None)
+        proxies_arg = {"http": proxy, "https": proxy} if proxy else None
+
+        if not captcha_cookies:
+            return None
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+
+        soup = BeautifulSoup(text, "lxml")
+        img_tag = soup.find("img", src=re.compile(r"^data:image/[a-z]+;base64,|/captcha|/image/", re.I))
+        form = soup.find("form")
+        if not img_tag or not form:
+            return None
+
+        captcha_src = img_tag["src"]
+        if captcha_src.startswith("data:"):
+            try:
+                import base64 as b64mod
+                b64_payload = captcha_src.split(",", 1)[1]
+                img_data = b64mod.b64decode(b64_payload)
+            except Exception:
+                return None
+        else:
+            img_data = await self._smart_request(captcha_src, is_binary=True)
+
+        if not img_data:
+            return None
+
+        if not hasattr(self, "_ocr_engine"):
+            self._ocr_engine = ddddocr.DdddOcr(show_ad=False)
+
+        res = self._ocr_engine.classification(img_data)
+        res_digits = "".join(c for c in str(res) if c.isdigit())
+        logger.debug(f"Folder captcha OCR: raw={res!r} digits={res_digits!r}")
+        if not res_digits:
+            return None
+
+        form_action = form.get("action", "") or original_url
+        if form_action.startswith("/"):
+            from urllib.parse import urlparse
+            parsed = urlparse(original_url)
+            form_action = f"{parsed.scheme}://{parsed.netloc}{form_action}"
+
+        captcha_input = soup.find("input", {"name": re.compile(r"captcha|code|val", re.I)})
+        field_name = captcha_input["name"] if captcha_input else "captcha"
+
+        post_data = {field_name: res_digits}
+        for hidden in form.find_all("input", type="hidden"):
+            if hidden.get("name"):
+                post_data[hidden["name"]] = hidden.get("value", "")
+
+        headers = {**self.base_headers, "referer": original_url}
+
+        def _do_post():
+            try:
+                return cffi_requests.post(
+                    form_action, data=post_data, headers=headers,
+                    cookies=captcha_cookies or {}, proxies=proxies_arg,
+                    impersonate="chrome131", timeout=20, allow_redirects=True,
+                )
+            except Exception as inner:
+                return inner
+
+        post_resp = await loop.run_in_executor(None, _do_post)
+        if isinstance(post_resp, Exception) or post_resp.status_code >= 400:
+            return None
+        
+        return post_resp.text if post_resp.text else None
 
     async def _curl_cffi_request(self, url: str, proxy, method: str, is_binary: bool, **kwargs):
         """
@@ -340,7 +463,7 @@ class MaxstreamExtractor:
         
         raise ExtractorError(f"Connection failed for {url} after trying all paths. Last error: {last_error}")
 
-    async def _solve_uprot_captcha(self, text: str, original_url: str, max_attempts: int = 4) -> str:
+    async def _solve_uprot_captcha(self, text: str, original_url: str, max_attempts: int = 6) -> str:
         """
         Find, decode and solve captcha on uprot page — with retry loop.
 
