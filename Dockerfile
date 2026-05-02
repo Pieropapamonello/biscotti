@@ -68,7 +68,10 @@ COPY . .
 # 5. Playwright is configured to use system Chromium (CHROME_BIN)
 # No need to run 'playwright install chromium' which saves ~500MB
 
-RUN chmod +x entrypoint.sh
+# Force LF line endings on shell scripts. A Windows clone via Git can leave
+# CRLF in entrypoint.sh which makes bash fail at startup with
+# `$'\r': command not found` and `syntax error near unexpected token $'do\r''`.
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 # 7. Metadata & Ports
 LABEL org.opencontainers.image.title="EasyProxy Monolith"
