@@ -377,6 +377,35 @@ class MaxstreamExtractor:
         raise ExtractorError(f"Connection failed for {url} after all parallel attempts.")
 
     @staticmethod
+    def _tesseract_classify(img_bytes):
+        """Tesseract-based OCR fallback with digit-only whitelist.
+
+        Used as a second opinion when ddddocr returns < 3 digits. Tesseract
+        is much weaker than ddddocr on raw captchas but, because it processes
+        the same image with completely different feature extraction, the two
+        engines fail on different captchas — an OR ensemble (`return whichever
+        gives 3 valid digits first`) lifts overall accuracy noticeably.
+
+        Returns the OCR string on success, empty string on any failure.
+        """
+        try:
+            import pytesseract
+            from PIL import Image, ImageFilter
+            import io
+            img = Image.open(io.BytesIO(img_bytes)).convert("L")
+            # Aggressive cleaning before tesseract — it needs a much cleaner
+            # image than ddddocr to give usable output.
+            img = img.point(lambda p: 255 if p >= 140 else 0, mode="L")
+            img = img.filter(ImageFilter.MaxFilter(3))
+            img = img.filter(ImageFilter.MinFilter(3))
+            # Single-line, digits only.
+            cfg = "--psm 7 -c tessedit_char_whitelist=0123456789"
+            return pytesseract.image_to_string(img, config=cfg).strip()
+        except Exception as e:
+            logger.debug(f"Tesseract OCR failed: {e}")
+            return ""
+
+    @staticmethod
     def _preprocess_captcha_png(img_bytes):
         """Binarize + denoise the captcha PNG to boost ddddocr accuracy.
 
@@ -502,16 +531,23 @@ class MaxstreamExtractor:
         if preprocess:
             logger.debug(f"Captcha solve: using preprocessed image ({len(ocr_input)} bytes vs {len(img_data)} raw)")
 
-        # Solve
+        # Primary solve: ddddocr.
         res = self._ocr_engine.classification(ocr_input)
-        # Strip OCR artifacts (asterisks, letters) — uprot enforces 3 digits.
-        # If we don't have exactly 3, the POST is guaranteed to fail; let the
-        # retry loop fetch a new captcha instead of wasting a POST.
         res_digits = "".join(c for c in str(res) if c.isdigit())
-        logger.debug(f"Captcha solved: raw={res!r} digits={res_digits!r}")
+        logger.debug(f"Captcha solved (ddddocr): raw={res!r} digits={res_digits!r}")
+
+        # Ensemble fallback: if ddddocr gave us != 3 digits, try tesseract on
+        # the same (preprocessed) bytes. The two engines fail on different
+        # captchas, so the OR-ensemble materially boosts the success rate.
         if len(res_digits) != 3:
-            logger.debug(f"Captcha solve: OCR returned {len(res_digits)} digits, need 3 — skip POST")
-            return None
+            tess = self._tesseract_classify(ocr_input)
+            tess_digits = "".join(c for c in str(tess) if c.isdigit())
+            logger.debug(f"Captcha solve (tesseract fallback): raw={tess!r} digits={tess_digits!r}")
+            if len(tess_digits) == 3:
+                res_digits = tess_digits
+            else:
+                logger.debug(f"Captcha solve: both OCRs failed (ddddocr {len(res_digits)}, tesseract {len(tess_digits)}) — skip POST")
+                return None
         res = res_digits
         
         # Prepare form action

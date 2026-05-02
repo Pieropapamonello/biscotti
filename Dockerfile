@@ -41,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     fonts-liberation \
     chromium-driver \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Environment Settings
