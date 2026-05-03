@@ -438,6 +438,49 @@ class MaxstreamExtractor:
             logger.debug(f"Captcha preprocessing failed: {e}, using original bytes")
             return img_bytes
 
+    @staticmethod
+    async def _cf_worker_ocr(img_bytes):
+        """Optional 3rd OCR backend: Cloudflare Workers AI vision LLM.
+
+        Local OCR (ddddocr + tesseract) tops out at ~50-65% on uprot's noisy
+        3-digit captcha. A vision LLM (Llama 4 Scout / Gemma 3 / LLaVA) gets
+        ~90%+. We POST the captcha PNG bytes to a user-deployed CF Worker
+        running NelloStream's `cfworker.js` (or any compatible worker) which
+        wraps `env.AI.run(...)` — see the deploy guide in the README.
+
+        Activated only when both env vars are set:
+          CF_WORKER_OCR_URL   e.g. https://uprot-proxy.user.workers.dev
+          CF_WORKER_OCR_AUTH  Worker AUTH_TOKEN (skip if Worker has no auth)
+
+        Returns the recognised digit string, or empty on any failure
+        (network error, non-200, missing config). Never raises — caller
+        falls through to "OCR exhausted" gracefully.
+        """
+        import os
+        base = os.getenv("CF_WORKER_OCR_URL", "").strip().rstrip("/")
+        if not base:
+            return ""
+        auth = os.getenv("CF_WORKER_OCR_AUTH", "").strip()
+        try:
+            import aiohttp
+            headers = {"content-type": "image/png"}
+            if auth:
+                headers["x-worker-auth"] = auth
+            url = f"{base}/?ocr=1&digits=3"
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(url, data=img_bytes, headers=headers) as resp:
+                    if resp.status != 200:
+                        logger.debug(f"CF Worker OCR HTTP {resp.status}")
+                        return ""
+                    data = await resp.json()
+                    digits = (data.get("digits") or "").strip()
+                    logger.debug(f"CF Worker OCR returned: {digits!r}")
+                    return digits
+        except Exception as e:
+            logger.debug(f"CF Worker OCR failed: {e}")
+            return ""
+
     async def _solve_uprot_captcha(self, text: str, original_url: str, max_attempts: int = 2) -> str:
         """Find, download and solve captcha on uprot page — with retry.
 
@@ -546,8 +589,16 @@ class MaxstreamExtractor:
             if len(tess_digits) == 3:
                 res_digits = tess_digits
             else:
-                logger.debug(f"Captcha solve: both OCRs failed (ddddocr {len(res_digits)}, tesseract {len(tess_digits)}) — skip POST")
-                return None
+                # 3rd backend: optional Cloudflare Workers AI vision LLM
+                # (no-op if CF_WORKER_OCR_URL env var isn't set).
+                cf_digits = await self._cf_worker_ocr(ocr_input)
+                cf_digits = "".join(c for c in str(cf_digits) if c.isdigit())
+                if len(cf_digits) == 3:
+                    logger.debug(f"Captcha solve (CF Worker AI): {cf_digits!r}")
+                    res_digits = cf_digits
+                else:
+                    logger.debug(f"Captcha solve: all OCRs failed (ddddocr {len(res_digits)}, tesseract {len(tess_digits)}, cf-ai {len(cf_digits)}) — skip POST")
+                    return None
         res = res_digits
         
         # Prepare form action
